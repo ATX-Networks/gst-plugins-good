@@ -41,6 +41,8 @@
 
 #ifndef G_OS_WIN32
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
 #endif
 
 #include "gst/glib-compat-private.h"
@@ -288,10 +290,6 @@ gst_multiudpsink_class_init (GstMultiUDPSinkClass * klass)
           "Automatically join/leave the multicast groups, FALSE means user"
           " has to do it himself", DEFAULT_AUTO_MULTICAST,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-  g_object_class_install_property (gobject_class, PROP_MULTICAST_IFACE,
-      g_param_spec_string ("multicast-iface", "Multicast Interface",
-          "The network interface on which to join the multicast group",
-          DEFAULT_MULTICAST_IFACE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_TTL,
       g_param_spec_int ("ttl", "Unicast TTL",
           "Used for setting the unicast TTL parameter",
@@ -343,8 +341,12 @@ gst_multiudpsink_class_init (GstMultiUDPSinkClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_BIND_ADDRESS,
       g_param_spec_string ("bind-address", "Bind Address",
-          "Address to bind the socket to", DEFAULT_BIND_ADDRESS,
+          "IPv4 address (interface) to which to limit output", DEFAULT_BIND_ADDRESS,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_MULTICAST_IFACE,
+      g_param_spec_string ("multicast-iface", "Multicast Interface",
+          "IPv6 network interface to which to limit output",
+          DEFAULT_MULTICAST_IFACE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_BIND_PORT,
       g_param_spec_int ("bind-port", "Bind Port",
           "Port to bind the socket to", 0, G_MAXUINT16,
@@ -1460,21 +1462,47 @@ gst_multiudpsink_start (GstBaseSink * bsink)
   }
 #endif
 
-#ifdef SO_BINDTODEVICE
-  if (sink->multi_iface) {
-    if (sink->used_socket) {
-      if (setsockopt (g_socket_get_fd (sink->used_socket), SOL_SOCKET,
-              SO_BINDTODEVICE, sink->multi_iface,
-              strlen (sink->multi_iface)) < 0)
-        GST_WARNING_OBJECT (sink, "setsockopt SO_BINDTODEVICE failed: %s",
-            strerror (errno));
-    }
-    if (sink->used_socket_v6) {
-      if (setsockopt (g_socket_get_fd (sink->used_socket_v6), SOL_SOCKET,
-              SO_BINDTODEVICE, sink->multi_iface,
-              strlen (sink->multi_iface)) < 0)
-        GST_WARNING_OBJECT (sink, "setsockopt SO_BINDTODEVICE failed (v6): %s",
-            strerror (errno));
+#ifdef IP_MULTICAST_IF
+  if (sink->multi_iface || sink->bind_address) {
+    /* With multicast operation you don't want to *bind* you want to set the multicast iface option
+    
+    Multicast option IP_MULTICAST_IF/IPV6_MULTICAST_IF is what sets the 
+    output of a sink to exit on a particular interface without reference 
+    to the OS-level multicast routing.
+    */
+    if (sink->used_socket && sink->bind_address) {
+      /* IPv4 multicast-if setting by bind_address */
+      struct in_addr ipv4_multicast_addr;
+      if (!inet_pton(AF_INET, sink->bind_address, &ipv4_multicast_addr)) {
+        /* IPv4 version of the option wants the local address of the target interface (instead of interface id) */
+        /* TODO: get ip address of the specified multi_iface rather than using the bind_address
+           but we need a portable ioctl replacement to get the ips */
+        GST_WARNING_OBJECT(sink,"Unable to set ipv4 multicast address to bind-address=%s", sink->bind_address);
+      } else {
+        GST_DEBUG_OBJECT(sink,"Limiting to address %s for IPv4",sink->bind_address);
+        setsockopt(
+          g_socket_get_fd (sink->used_socket),
+          IPPROTO_IP,
+          IP_MULTICAST_IF,
+          &ipv4_multicast_addr,
+          sizeof(ipv4_multicast_addr)
+        );
+      }
+    } else if (sink->used_socket_v6 && sink->multi_iface) {
+      /* IPv6 multicast-if setting by mcast_iface binding */
+      uint32_t v6_interface_index = if_nametoindex(sink->multi_iface);
+      if (v6_interface_index == 0) {
+        GST_WARNING_OBJECT(sink,"Unable to find interface with name %s for ipv6 multicast bind", sink->multi_iface);
+      } else {
+        GST_DEBUG_OBJECT(sink,"Limiting to interface %s (index %u) for IPv6",sink->multi_iface,v6_interface_index);
+        setsockopt(
+          g_socket_get_fd (sink->used_socket_v6),
+          IPPROTO_IPV6,
+          IPV6_MULTICAST_IF,
+          &v6_interface_index,
+          sizeof(v6_interface_index)
+        );
+      }
     }
   }
 #endif
